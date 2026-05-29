@@ -178,6 +178,21 @@ impl RedisConnection {
         self.connection.sadd(self.namespaced_key(key), value).await
     }
 
+    pub async fn hset(
+        &mut self,
+        key: String,
+        field: String,
+        value: String,
+    ) -> Result<(), RedisError> {
+        self.connection
+            .hset(self.namespaced_key(key), field, value)
+            .await
+    }
+
+    pub async fn hdel(&mut self, key: String, field: String) -> Result<(), RedisError> {
+        self.connection.hdel(self.namespaced_key(key), field).await
+    }
+
     pub async fn set_nx_ex<V>(
         &mut self,
         key: String,
