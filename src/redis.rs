@@ -370,6 +370,39 @@ impl RedisConnection {
         self.connection.smembers(self.namespaced_key(key)).await
     }
 
+    /// Atomically requeue a reliably-claimed job interrupted by shutdown:
+    /// remove `payload` from the in-progress list and, **only if it was still
+    /// there**, RPUSH it onto `queue`. Returns `true` if it moved the job,
+    /// `false` if the job was already gone (e.g. orphan recovery on the
+    /// replacement process already requeued it). The atomicity is what stops
+    /// the shutdown requeue and recovery from BOTH re-queuing the same job —
+    /// without it they race and produce a duplicate. Both keys are namespaced.
+    pub async fn requeue_if_inprogress(
+        &mut self,
+        inprogress: String,
+        queue: String,
+        payload: String,
+    ) -> Result<bool, RedisError> {
+        const SCRIPT: &str = r"
+            if redis.call('LREM', KEYS[1], 1, ARGV[1]) > 0 then
+                redis.call('RPUSH', KEYS[2], ARGV[1])
+                return 1
+            end
+            return 0
+        ";
+        let inprogress = self.namespaced_key(inprogress);
+        let queue = self.namespaced_key(queue);
+        let moved: i64 = redis::cmd("EVAL")
+            .arg(SCRIPT)
+            .arg(2)
+            .arg(inprogress)
+            .arg(queue)
+            .arg(payload)
+            .query_async(self.unnamespaced_borrow_mut())
+            .await?;
+        Ok(moved == 1)
+    }
+
     pub async fn exists(&mut self, key: String) -> Result<bool, RedisError> {
         self.connection.exists(self.namespaced_key(key)).await
     }

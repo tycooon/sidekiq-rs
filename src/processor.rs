@@ -462,43 +462,52 @@ impl Processor {
     /// Push a job that was interrupted by shutdown back onto its queue so a
     /// surviving/replacement process runs it — the free-Sidekiq
     /// `BasicFetch#bulk_requeue` behavior ("worse to lose a job than to run it
-    /// twice", i.e. at-least-once). In reliable mode the in-progress copy is
-    /// also removed afterward so [`recover_orphaned_work`] won't requeue it a
-    /// second time. Best-effort: a Redis error is logged, and in reliable mode
-    /// orphan recovery is the backstop.
+    /// twice", i.e. at-least-once).
+    ///
+    /// In reliable mode this is an **atomic** move (`requeue_if_inprogress`):
+    /// the job is RPUSH'd back *only if* it's still in our in-progress list. If
+    /// orphan recovery on the replacement process already requeued it (it
+    /// drains dead processes' in-progress lists, and our heartbeat is gone by
+    /// the time we get here), the move is a no-op — so the shutdown requeue and
+    /// recovery never both requeue the same job and produce a duplicate. In
+    /// BRPOP mode the job lives only in memory (no in-progress copy, no
+    /// recovery to race), so it's pushed back unconditionally. Best-effort: a
+    /// Redis error is logged; in reliable mode orphan recovery is the backstop.
     async fn requeue_interrupted(&self, work: &UnitOfWork) {
         let queue_key = format!("queue:{}", work.job.queue);
-        let payload = match &work.reliable {
-            Some(claim) => claim.job_raw.clone(),
-            None => match serde_json::to_string(&work.job) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!(jid = %work.job.jid, "requeue on shutdown: serialize failed: {:?}", e);
-                    return;
-                }
-            },
-        };
 
-        let result: Result<()> = async {
+        let result: Result<bool> = async {
             let mut conn = self.redis.get().await?;
-            // RPUSH first so a failure here never loses the job (at worst it's
-            // requeued twice). Then drop the in-progress copy (reliable mode).
-            conn.rpush(queue_key.clone(), payload.clone()).await?;
-            if let Some(claim) = &work.reliable {
-                conn.lrem(claim.inprogress_key.clone(), -1, claim.job_raw.clone())
-                    .await?;
+            match &work.reliable {
+                Some(claim) => Ok(conn
+                    .requeue_if_inprogress(
+                        claim.inprogress_key.clone(),
+                        queue_key.clone(),
+                        claim.job_raw.clone(),
+                    )
+                    .await?),
+                None => {
+                    conn.rpush(queue_key.clone(), serde_json::to_string(&work.job)?)
+                        .await?;
+                    Ok(true)
+                }
             }
-            Ok(())
         }
         .await;
 
         match result {
-            Ok(()) => info!(
+            Ok(true) => info!(
                 target: "sidekiq",
                 class = %work.job.class,
                 jid = %work.job.jid,
                 queue = %work.job.queue,
                 "requeued in-flight job interrupted by shutdown",
+            ),
+            Ok(false) => info!(
+                target: "sidekiq",
+                class = %work.job.class,
+                jid = %work.job.jid,
+                "shutdown: job already requeued by recovery — not duplicating",
             ),
             Err(e) => error!(
                 jid = %work.job.jid,
@@ -1296,6 +1305,44 @@ mod reliable_fetch_tests {
             llen(&redis, &inprogress).await,
             0,
             "in-progress copy removed"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    /// If orphan recovery already requeued the job (its in-progress copy is
+    /// gone), the shutdown requeue is a no-op — it must NOT push a duplicate.
+    /// This is the race that produced two copies of the same backfill jid.
+    #[tokio::test]
+    async fn requeue_interrupted_does_not_duplicate_already_recovered_job() {
+        let redis = test_pool().await;
+        let q = unique("rf_intr_dup");
+        let queue_key = format!("queue:{q}");
+        let identity = unique("duphost:1");
+        let inprogress = format!("{queue_key}:inprogress:{identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        // In-progress list is EMPTY — i.e. recovery already moved the job out.
+        let processor = Processor::new(redis.clone(), vec![q.clone()]);
+        let job: crate::Job = serde_json::from_str(&payload).unwrap();
+        let work = crate::UnitOfWork {
+            queue: queue_key.clone(),
+            job,
+            reliable: Some(crate::ReliableClaim {
+                inprogress_key: inprogress.clone(),
+                job_raw: payload.clone(),
+            }),
+        };
+
+        processor.requeue_interrupted(&work).await;
+
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            0,
+            "must NOT requeue a job recovery already took (no duplicate)"
         );
 
         del(&redis, &queue_key).await;
