@@ -87,6 +87,16 @@ pub struct ProcessorConfig {
     /// the equivalent of Sidekiq Pro's `super_fetch`. Delivery becomes
     /// at-least-once, so workers should be idempotent.
     ///
+    /// Recovery judges a process dead by the absence of its heartbeat hash
+    /// (`EXISTS <identity>`, a 60s TTL refreshed every 5s). This makes the
+    /// heartbeat operationally load-bearing: if a *live* process's beat is
+    /// starved past the 60s TTL, a sibling will judge it dead and requeue its
+    /// in-flight jobs, running them a second time. Because each worker holds a
+    /// pooled connection for its blocking `BRPOPLPUSH`, size the Redis pool to
+    /// at least `num_workers` + headroom so the heartbeat publish never blocks
+    /// on connection acquisition. The 12× margin (60s TTL / 5s beat) makes this
+    /// unlikely, but it is the main new operational dependency of this mode.
+    ///
     /// Defaults to `false`, preserving the original at-most-once `BRPOP` fetch.
     pub reliable: bool,
 }
@@ -798,14 +808,12 @@ pub(crate) async fn recover_orphaned_work(
         }
 
         // Owner is dead: move every stranded job back onto its queue.
-        loop {
-            match conn
-                .rpoplpush(member.clone(), queue_key.to_string())
-                .await?
-            {
-                Some(_) => requeued += 1,
-                None => break,
-            }
+        while conn
+            .rpoplpush(member.clone(), queue_key.to_string())
+            .await?
+            .is_some()
+        {
+            requeued += 1;
         }
 
         // The list is now empty; drop the registry entry. If the owner somehow
@@ -852,6 +860,11 @@ mod reliable_fetch_tests {
     use super::*;
     use crate::{ProcessorConfig, RedisConnectionManager, RedisPool};
     use bb8::Pool;
+    // Tests that touch the shared real `WORKING_SET` are `#[serial]` so one
+    // test's recovery sweep can't drain another's freshly-claimed (heartbeat-
+    // less) in-progress list mid-run. The recover-only tests above use unique
+    // working-set keys and need no serialization.
+    use serial_test::serial;
 
     async fn test_pool() -> RedisPool {
         let manager = RedisConnectionManager::new("redis://127.0.0.1/").unwrap();
@@ -1015,6 +1028,7 @@ mod reliable_fetch_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn reliable_fetch_claims_into_inprogress_then_acks() {
         let redis = test_pool().await;
         let q = unique("rf_claim");
@@ -1071,5 +1085,72 @@ mod reliable_fetch_tests {
             .query_async(conn.unnamespaced_borrow_mut())
             .await
             .unwrap();
+    }
+
+    /// End-to-end: a worker claims a job via the real `fetch_reliable` path,
+    /// then "crashes" (we never ack and it has no heartbeat), and a sibling's
+    /// `recover_orphaned_work` sweep returns the stranded job to its queue.
+    /// Asserts on the specific queue/list rather than the requeued count so it
+    /// tolerates unrelated entries in the shared `WORKING_SET`.
+    #[tokio::test]
+    #[serial]
+    async fn reliable_fetch_then_recovery_returns_stranded_job_to_queue() {
+        let redis = test_pool().await;
+        let q = unique("rf_e2e");
+        let queue_key = format!("queue:{q}");
+        let dead_identity = unique("e2ehost:111"); // never gets a heartbeat
+        let inprogress = format!("{queue_key}:inprogress:{dead_identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        lpush(&redis, &queue_key, &payload).await;
+
+        // Worker claims the job through the real fetch path, then crashes
+        // (function returns, we never ack — simulating a killed process).
+        let mut processor = Processor::new(redis.clone(), vec![q.clone()])
+            .with_config(ProcessorConfig::default().num_workers(1).reliable(true));
+        processor.identity = Some(dead_identity.clone());
+        let uow = processor
+            .fetch_reliable(&dead_identity)
+            .await
+            .unwrap()
+            .expect("a job should be claimed");
+        assert_eq!(uow.job.jid, jid);
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            0,
+            "claimed out of the queue"
+        );
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            1,
+            "parked in the in-progress list"
+        );
+        drop(uow); // the "crash": the claim is dropped without ever being acked
+
+        // A sibling process sweeps: the crashed worker has no heartbeat, so its
+        // stranded job is requeued.
+        recover_orphaned_work(&redis, &unique("siblinghost:222"), WORKING_SET)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            0,
+            "in-progress list drained by recovery"
+        );
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            1,
+            "stranded job returned to its queue"
+        );
+        assert!(
+            !sismember(&redis, WORKING_SET, &inprogress).await,
+            "registry entry cleared once drained"
+        );
+
+        del(&redis, &queue_key).await;
     }
 }
