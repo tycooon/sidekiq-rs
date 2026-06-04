@@ -33,6 +33,12 @@ const PAUSED_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// (there's no `BRPOP` to block on). Matches the `BRPOP` poll cadence.
 const ALL_PAUSED_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Redis SET listing all known queues — what Sidekiq's web UI renders on its
+/// Queues page (`Sidekiq::Queue.all` = `SSCAN queues`). Sidekiq adds to it on
+/// client push; we also register consumed queues here on boot so they're
+/// visible when idle.
+const QUEUES_SET: &str = "queues";
+
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub enum WorkFetcher {
     NoWorkFound,
@@ -410,6 +416,30 @@ impl Processor {
         }
     }
 
+    /// Add this processor's (bare) queue names to the Redis `queues` set so the
+    /// Sidekiq web UI lists them even when idle. Sidekiq only registers a queue
+    /// there on client push (`Client#push` → `SADD queues`), so a consume-only
+    /// queue stays invisible — and a queue deleted while empty never reappears —
+    /// until its next job is enqueued. Best-effort: a Redis error is logged.
+    async fn register_queues(redis: &RedisPool, queues: &[String]) {
+        if queues.is_empty() {
+            return;
+        }
+        let result: Result<()> = async {
+            let mut conn = redis.get().await?;
+            conn.sadd(QUEUES_SET.to_string(), queues.to_vec()).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "sidekiq",
+                error = %e,
+                "failed to register queues in the 'queues' set",
+            );
+        }
+    }
+
     /// Re-order the `Processor#queues` based on the `ProcessorConfig#balance_strategy`.
     fn run_balance_strategy(&mut self) {
         if self.queues.is_empty() {
@@ -736,6 +766,13 @@ impl Processor {
         // that's already paused isn't briefly drained on boot. Refreshed by the
         // periodic task spawned below.
         Self::refresh_paused_into(&self.redis, &self.paused).await;
+
+        // Register the queues we consume in the Redis `queues` set so they show
+        // up in the Sidekiq web UI even when idle, and reappear after a redeploy
+        // if one was deleted while empty. Sidekiq only adds a queue to this set
+        // on client push, so a consume-only queue (e.g. a UI-triggered backfill
+        // queue) would otherwise be invisible until its next job is enqueued.
+        Self::register_queues(&self.redis, &self.human_readable_queues).await;
 
         // Logic for spawning shared workers (workers that handles multiple queues) and dedicated
         // workers (workers that handle a single queue).
@@ -1552,5 +1589,34 @@ mod reliable_fetch_tests {
 
         del(&redis, &format!("queue:{paused_q}")).await;
         del(&redis, &format!("queue:{active_q}")).await;
+    }
+
+    /// Boot registration: consumed queues are added to the `queues` set so the
+    /// web UI lists them (and they reappear after a redeploy if deleted empty).
+    #[tokio::test]
+    async fn register_queues_adds_them_to_the_queues_set() {
+        let redis = test_pool().await;
+        let q1 = unique("rf_reg");
+        let q2 = unique("rf_reg");
+
+        Processor::register_queues(&redis, &[q1.clone(), q2.clone()]).await;
+
+        assert!(
+            sismember(&redis, "queues", &q1).await,
+            "q1 registered in the queues set"
+        );
+        assert!(
+            sismember(&redis, "queues", &q2).await,
+            "q2 registered in the queues set"
+        );
+
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("SREM")
+            .arg("queues")
+            .arg(&q1)
+            .arg(&q2)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
     }
 }
