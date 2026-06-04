@@ -304,4 +304,62 @@ impl RedisConnection {
     {
         self.connection.zrem(self.namespaced_key(key), value).await
     }
+
+    /// Reliable, non-blocking claim: atomically move the tail element of
+    /// `source` to the head of `destination`, returning the moved element
+    /// (`None` when `source` is empty). Both keys are namespaced. Used by
+    /// reliable fetch to claim a job into a per-process in-progress list.
+    pub async fn rpoplpush(
+        &mut self,
+        source: String,
+        destination: String,
+    ) -> Result<Option<String>, RedisError> {
+        self.connection
+            .rpoplpush(
+                self.namespaced_key(source),
+                self.namespaced_key(destination),
+            )
+            .await
+    }
+
+    /// Blocking variant of [`Self::rpoplpush`]: waits up to `timeout` seconds
+    /// for an element on `source` before moving it to `destination`. Returns
+    /// `None` on timeout. Both keys are namespaced.
+    pub async fn brpoplpush(
+        &mut self,
+        source: String,
+        destination: String,
+        timeout: usize,
+    ) -> Result<Option<String>, RedisError> {
+        self.connection
+            .brpoplpush(
+                self.namespaced_key(source),
+                self.namespaced_key(destination),
+                timeout as f64,
+            )
+            .await
+    }
+
+    /// Remove up to `count` copies of `value` from the list at `key` (Redis
+    /// `LREM`); a negative `count` scans from the tail. Returns the number of
+    /// elements removed. Key is namespaced. Used by reliable fetch to ack a
+    /// finished job out of its in-progress list.
+    pub async fn lrem(
+        &mut self,
+        key: String,
+        count: isize,
+        value: String,
+    ) -> Result<usize, RedisError> {
+        self.connection
+            .lrem(self.namespaced_key(key), count, value)
+            .await
+    }
+
+    pub async fn smembers(&mut self, key: String) -> Result<Vec<String>, RedisError> {
+        self.connection.smembers(self.namespaced_key(key)).await
+    }
+
+    pub async fn exists(&mut self, key: String) -> Result<bool, RedisError> {
+        self.connection.exists(self.namespaced_key(key)).await
+    }
 }
