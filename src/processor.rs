@@ -5,7 +5,7 @@ use crate::{
     ServerMiddleware, StatsPublisher, UnitOfWork, Worker, WorkerRef,
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::select;
 use tokio::task::JoinSet;
@@ -17,6 +17,21 @@ use tracing::{debug, error, info};
 /// belonging to dead processes and requeue them. Members are the pre-namespace
 /// in-progress list keys (`queue:<q>:inprogress:<identity>`).
 const WORKING_SET: &str = "reliable_fetch:working";
+
+/// Redis SET of paused queue names (bare, e.g. `events_loader_backfill`),
+/// written by Sidekiq's `Queue#pause!`/`#unpause!` (`SADD`/`SREM "paused"`).
+/// Fetch skips any queue in this set, matching Sidekiq Pro's
+/// `BasicFetch`/`SuperFetch` `active_queues = queues - paused`.
+const PAUSED_SET: &str = "paused";
+
+/// How often the cached paused-queue set is refreshed from Redis. Sidekiq Pro
+/// updates instantly via pub/sub; we poll, so a pause/unpause takes effect
+/// within this window. A few seconds of lag is fine for an operator pause.
+const PAUSED_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Sleep when every configured queue is paused, so the fetch loop doesn't spin
+/// (there's no `BRPOP` to block on). Matches the `BRPOP` poll cadence.
+const ALL_PAUSED_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub enum WorkFetcher {
@@ -47,6 +62,10 @@ pub struct Processor {
     // worker gets its own); the `SADD` is idempotent so a missed dedupe is
     // harmless.
     registered_inprogress: HashSet<String>,
+    // Bare names of currently-paused queues (the Redis `paused` set), refreshed
+    // periodically by a `run()` background task and shared across all worker
+    // clones. `fetch` skips any queue in here. Empty until the first refresh.
+    paused: Arc<RwLock<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -213,6 +232,7 @@ impl Processor {
             identity: None,
             tid: None,
             registered_inprogress: HashSet::new(),
+            paused: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -240,12 +260,15 @@ impl Processor {
     async fn fetch_brpop(&mut self) -> Result<Option<UnitOfWork>> {
         self.run_balance_strategy();
 
-        let response: Option<(String, String)> = self
-            .redis
-            .get()
-            .await?
-            .brpop(self.queues.clone().into(), 2)
-            .await?;
+        let active = self.active_queues();
+        if active.is_empty() {
+            // Every configured queue is paused — back off so we don't spin
+            // (there's no BRPOP to block on).
+            tokio::time::sleep(ALL_PAUSED_BACKOFF).await;
+            return Ok(None);
+        }
+
+        let response: Option<(String, String)> = self.redis.get().await?.brpop(active, 2).await?;
 
         if let Some((queue, job_raw)) = response {
             let job: Job = serde_json::from_str(&job_raw)?;
@@ -270,7 +293,12 @@ impl Processor {
     /// by the next tick's sweep (≤2s later).
     async fn fetch_reliable(&mut self, identity: &str) -> Result<Option<UnitOfWork>> {
         self.run_balance_strategy();
-        let queues: Vec<String> = self.queues.iter().cloned().collect();
+        let queues = self.active_queues();
+        if queues.is_empty() {
+            // Every configured queue is paused — back off rather than spin.
+            tokio::time::sleep(ALL_PAUSED_BACKOFF).await;
+            return Ok(None);
+        }
 
         // (queue_key, inprogress_key, job_raw) for the first claim, if any.
         let claim: Option<(String, String, String)> = {
@@ -342,6 +370,44 @@ impl Processor {
     /// list to the process that died.
     fn inprogress_key(queue_key: &str, identity: &str) -> String {
         format!("{queue_key}:inprogress:{identity}")
+    }
+
+    /// This processor's queues (`queue:<name>` form, in current balance order)
+    /// minus any that are paused — Sidekiq's `active_queues = queues - paused`.
+    /// The cached `paused` set holds bare names, so the `queue:` prefix is
+    /// stripped to compare. An empty result means every queue is paused.
+    fn active_queues(&self) -> Vec<String> {
+        let paused = self.paused.read().unwrap_or_else(|e| e.into_inner());
+        self.queues
+            .iter()
+            .filter(|q| !paused.contains(q.strip_prefix("queue:").unwrap_or(q)))
+            .cloned()
+            .collect()
+    }
+
+    /// Refresh the cached paused-queue set from Redis (`SMEMBERS paused`). On a
+    /// Redis error the previous set is kept (so a blip doesn't accidentally
+    /// un-pause every queue). Static so the `run()` refresher task can call it
+    /// with just the pool + shared set rather than a whole `Processor` clone.
+    async fn refresh_paused_into(redis: &RedisPool, paused: &Arc<RwLock<HashSet<String>>>) {
+        let members: Result<Vec<String>> = async {
+            let mut conn = redis.get().await?;
+            Ok(conn.smembers(PAUSED_SET.to_string()).await?)
+        }
+        .await;
+        match members {
+            Ok(members) => {
+                let set: HashSet<String> = members.into_iter().collect();
+                if let Ok(mut w) = paused.write() {
+                    *w = set;
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "sidekiq",
+                error = %e,
+                "failed to refresh paused-queue set; keeping last known",
+            ),
+        }
     }
 
     /// Re-order the `Processor#queues` based on the `ProcessorConfig#balance_strategy`.
@@ -666,6 +732,11 @@ impl Processor {
             }
         }
 
+        // Load the paused-queue set BEFORE workers start fetching, so a queue
+        // that's already paused isn't briefly drained on boot. Refreshed by the
+        // periodic task spawned below.
+        Self::refresh_paused_into(&self.redis, &self.paused).await;
+
         // Logic for spawning shared workers (workers that handles multiple queues) and dedicated
         // workers (workers that handle a single queue).
         let spawn_worker = |mut processor: Processor,
@@ -844,6 +915,25 @@ impl Processor {
                 }
             });
         }
+
+        // Periodically refresh the paused-queue set so `Queue#pause!` /
+        // `#unpause!` from the Sidekiq web UI (or API) takes effect here within
+        // `PAUSED_REFRESH_INTERVAL`.
+        join_set.spawn({
+            let redis = self.redis.clone();
+            let paused = self.paused.clone();
+            let cancellation_token = self.cancellation_token.clone();
+            async move {
+                loop {
+                    select! {
+                        _ = tokio::time::sleep(PAUSED_REFRESH_INTERVAL) => {}
+                        _ = cancellation_token.cancelled() => break,
+                    }
+                    Self::refresh_paused_into(&redis, &paused).await;
+                }
+                debug!("Broke out of loop for paused-queue refresh");
+            }
+        });
 
         while let Some(result) = join_set.join_next().await {
             if let Err(err) = result {
@@ -1377,5 +1467,90 @@ mod reliable_fetch_tests {
         );
 
         del(&redis, &queue_key).await;
+    }
+
+    #[tokio::test]
+    async fn active_queues_excludes_paused() {
+        let redis = test_pool().await;
+        let p = Processor::new(redis, vec!["a".into(), "b".into(), "c".into()]);
+        *p.paused.write().unwrap() = std::collections::HashSet::from(["b".to_string()]);
+
+        assert_eq!(
+            p.active_queues(),
+            vec!["queue:a".to_string(), "queue:c".to_string()],
+            "paused queue 'b' is filtered out of the fetch set",
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_paused_loads_the_redis_paused_set() {
+        let redis = test_pool().await;
+        let q = unique("rf_paused_refresh");
+
+        // Mark the queue paused exactly like `Sidekiq::Queue#pause!` does.
+        {
+            let mut conn = redis.get().await.unwrap();
+            let _: i64 = redis::cmd("SADD")
+                .arg(PAUSED_SET)
+                .arg(&q)
+                .query_async(conn.unnamespaced_borrow_mut())
+                .await
+                .unwrap();
+        }
+
+        let paused = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        Processor::refresh_paused_into(&redis, &paused).await;
+        assert!(
+            paused.read().unwrap().contains(&q),
+            "refresh should pick up the paused queue from the Redis 'paused' set",
+        );
+
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("SREM")
+            .arg(PAUSED_SET)
+            .arg(&q)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_paused_queue_and_takes_the_active_one() {
+        let redis = test_pool().await;
+        let paused_q = unique("rf_pq");
+        let active_q = unique("rf_aq");
+        let pjid = unique("pjid");
+        let ajid = unique("ajid");
+        let mk = |q: &str, jid: &str| {
+            format!(
+                r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+            )
+        };
+        lpush(&redis, &format!("queue:{paused_q}"), &mk(&paused_q, &pjid)).await;
+        lpush(&redis, &format!("queue:{active_q}"), &mk(&active_q, &ajid)).await;
+
+        // Paused queue listed FIRST; no rotation, so if it weren't skipped it
+        // would be drained first.
+        let mut processor = Processor::new(redis.clone(), vec![paused_q.clone(), active_q.clone()])
+            .with_config(ProcessorConfig::default().balance_strategy(BalanceStrategy::None));
+        *processor.paused.write().unwrap() = std::collections::HashSet::from([paused_q.clone()]);
+
+        let uow = processor
+            .fetch_brpop()
+            .await
+            .unwrap()
+            .expect("the active queue's job should be fetched");
+        assert_eq!(
+            uow.job.jid, ajid,
+            "fetched from the active queue, skipping the paused one"
+        );
+        assert_eq!(
+            llen(&redis, &format!("queue:{paused_q}")).await,
+            1,
+            "paused queue's job is left untouched",
+        );
+
+        del(&redis, &format!("queue:{paused_q}")).await;
+        del(&redis, &format!("queue:{active_q}")).await;
     }
 }
