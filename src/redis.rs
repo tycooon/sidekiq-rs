@@ -171,6 +171,17 @@ impl RedisConnection {
         self.connection.lpush(self.namespaced_key(key), value).await
     }
 
+    /// Push to the tail of a list. A job RPUSH'd onto its queue is the next one
+    /// a `BRPOP`/`RPOPLPUSH` consumer picks up — used by the shutdown requeue
+    /// so an interrupted job re-runs promptly (matches Ruby
+    /// `BasicFetch#bulk_requeue` / `UnitOfWork#requeue`). Key is namespaced.
+    pub async fn rpush<V>(&mut self, key: String, value: V) -> Result<(), RedisError>
+    where
+        V: ToRedisArgs + Send + Sync,
+    {
+        self.connection.rpush(self.namespaced_key(key), value).await
+    }
+
     pub async fn sadd<V>(&mut self, key: String, value: V) -> Result<(), RedisError>
     where
         V: ToRedisArgs + Send + Sync,

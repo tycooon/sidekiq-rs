@@ -6,6 +6,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::select;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -99,6 +100,19 @@ pub struct ProcessorConfig {
     ///
     /// Defaults to `false`, preserving the original at-most-once `BRPOP` fetch.
     pub reliable: bool,
+
+    /// On shutdown (the [`Processor::get_cancellation_token`] is cancelled,
+    /// e.g. from a SIGTERM handler), how long an in-flight job is given to
+    /// finish before it is interrupted and pushed back onto its queue for a
+    /// surviving/replacement process to run. This is the Rust equivalent of
+    /// Ruby Sidekiq's shutdown `timeout` + `BasicFetch#bulk_requeue`: jobs
+    /// that finish within the window are acked normally; those that don't
+    /// (e.g. a long backfill) are re-queued (at-least-once) rather than lost
+    /// to the imminent process exit. Set it comfortably below your
+    /// orchestrator's kill grace (e.g. k8s `terminationGracePeriodSeconds`) so
+    /// the requeue completes before SIGKILL. Defaults to 25s (Ruby Sidekiq's
+    /// default `-t`).
+    pub shutdown_grace: Duration,
 }
 
 #[derive(Default, Clone)]
@@ -148,6 +162,13 @@ impl ProcessorConfig {
         self.reliable = reliable;
         self
     }
+
+    /// Set the shutdown grace window (see [`ProcessorConfig::shutdown_grace`]).
+    #[must_use]
+    pub fn shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
+    }
 }
 
 impl Default for ProcessorConfig {
@@ -157,6 +178,7 @@ impl Default for ProcessorConfig {
             balance_strategy: Default::default(),
             queue_configs: Default::default(),
             reliable: false,
+            shutdown_grace: Duration::from_secs(25),
         }
     }
 }
@@ -379,8 +401,38 @@ impl Processor {
         // Publish this job to the Sidekiq WorkSet (`<identity>:work`) so it shows
         // on the web "Busy" page, then clear it whether the job succeeds or fails.
         self.set_work(&work).await;
-        let result = self.chain.call(&work.job, worker, self.redis.clone()).await;
+
+        // Run the job. If shutdown is signalled (the cancellation token fires,
+        // e.g. from a SIGTERM handler) while the job is in flight, give it
+        // `shutdown_grace` to finish; if it doesn't, interrupt it and push it
+        // back onto its queue so a surviving/replacement process runs it —
+        // Ruby Sidekiq's shutdown `timeout` + `BasicFetch#bulk_requeue`. Without
+        // this a long job (e.g. a backfill) outlives the OS kill grace and is
+        // lost. `None` ⇒ interrupted-and-requeued (don't ack/log "done").
+        let cancel = self.cancellation_token.clone();
+        let grace = self.config.shutdown_grace;
+        let outcome: Option<Result<()>> = {
+            let job_fut = self.chain.call(&work.job, worker, self.redis.clone());
+            tokio::pin!(job_fut);
+            tokio::select! {
+                biased;
+                r = &mut job_fut => Some(r),
+                // Shutdown signalled: let the job finish within the grace
+                // window. `timeout(..).ok()` is `Some(result)` if it finished,
+                // `None` (Elapsed) if it must be interrupted and requeued.
+                () = cancel.cancelled() => tokio::time::timeout(grace, &mut job_fut).await.ok(),
+            }
+        };
+
         self.clear_work().await;
+
+        let Some(result) = outcome else {
+            // Interrupted by shutdown after the grace window: requeue the job
+            // (and, in reliable mode, drop its in-progress copy so recovery
+            // doesn't run it a second time) so the next process picks it up.
+            self.requeue_interrupted(&work).await;
+            return Ok(WorkFetcher::Done);
+        };
 
         // Reliable fetch: the job has reached a terminal state inside
         // `chain.call` — it either succeeded or the retry middleware already
@@ -405,6 +457,55 @@ impl Processor {
             "jid" = &work.job.jid}, "sidekiq");
 
         Ok(WorkFetcher::Done)
+    }
+
+    /// Push a job that was interrupted by shutdown back onto its queue so a
+    /// surviving/replacement process runs it — the free-Sidekiq
+    /// `BasicFetch#bulk_requeue` behavior ("worse to lose a job than to run it
+    /// twice", i.e. at-least-once). In reliable mode the in-progress copy is
+    /// also removed afterward so [`recover_orphaned_work`] won't requeue it a
+    /// second time. Best-effort: a Redis error is logged, and in reliable mode
+    /// orphan recovery is the backstop.
+    async fn requeue_interrupted(&self, work: &UnitOfWork) {
+        let queue_key = format!("queue:{}", work.job.queue);
+        let payload = match &work.reliable {
+            Some(claim) => claim.job_raw.clone(),
+            None => match serde_json::to_string(&work.job) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(jid = %work.job.jid, "requeue on shutdown: serialize failed: {:?}", e);
+                    return;
+                }
+            },
+        };
+
+        let result: Result<()> = async {
+            let mut conn = self.redis.get().await?;
+            // RPUSH first so a failure here never loses the job (at worst it's
+            // requeued twice). Then drop the in-progress copy (reliable mode).
+            conn.rpush(queue_key.clone(), payload.clone()).await?;
+            if let Some(claim) = &work.reliable {
+                conn.lrem(claim.inprogress_key.clone(), -1, claim.job_raw.clone())
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => info!(
+                target: "sidekiq",
+                class = %work.job.class,
+                jid = %work.job.jid,
+                queue = %work.job.queue,
+                "requeued in-flight job interrupted by shutdown",
+            ),
+            Err(e) => error!(
+                jid = %work.job.jid,
+                "requeue on shutdown failed (reliable-fetch recovery is the backstop): {:?}",
+                e
+            ),
+        }
     }
 
     /// Record an in-flight job in this process's Sidekiq WorkSet
@@ -1149,6 +1250,83 @@ mod reliable_fetch_tests {
         assert!(
             !sismember(&redis, WORKING_SET, &inprogress).await,
             "registry entry cleared once drained"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    /// The shutdown requeue (`BasicFetch#bulk_requeue` parity): a job
+    /// interrupted by SIGTERM is pushed back onto its queue, and in reliable
+    /// mode its in-progress copy is removed so recovery won't double it.
+    #[tokio::test]
+    async fn requeue_interrupted_pushes_back_and_clears_inprogress() {
+        let redis = test_pool().await;
+        let q = unique("rf_intr");
+        let queue_key = format!("queue:{q}");
+        let identity = unique("intrhost:1");
+        let inprogress = format!("{queue_key}:inprogress:{identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        // Simulate a reliably-claimed job: its payload sits in the in-progress
+        // list and the main queue is empty.
+        lpush(&redis, &inprogress, &payload).await;
+
+        let processor = Processor::new(redis.clone(), vec![q.clone()]);
+        let job: crate::Job = serde_json::from_str(&payload).unwrap();
+        let work = crate::UnitOfWork {
+            queue: queue_key.clone(),
+            job,
+            reliable: Some(crate::ReliableClaim {
+                inprogress_key: inprogress.clone(),
+                job_raw: payload.clone(),
+            }),
+        };
+
+        processor.requeue_interrupted(&work).await;
+
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            1,
+            "job pushed back onto its queue"
+        );
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            0,
+            "in-progress copy removed"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    /// Non-reliable (BRPOP) jobs are also requeued on shutdown — the payload is
+    /// re-serialized from the job (there's no in-progress copy to move).
+    #[tokio::test]
+    async fn requeue_interrupted_brpop_job_is_pushed_back() {
+        let redis = test_pool().await;
+        let q = unique("rf_intr_basic");
+        let queue_key = format!("queue:{q}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        let processor = Processor::new(redis.clone(), vec![q.clone()]);
+        let job: crate::Job = serde_json::from_str(&payload).unwrap();
+        let work = crate::UnitOfWork {
+            queue: queue_key.clone(),
+            job,
+            reliable: None,
+        };
+
+        processor.requeue_interrupted(&work).await;
+
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            1,
+            "BRPOP job pushed back onto its queue"
         );
 
         del(&redis, &queue_key).await;
