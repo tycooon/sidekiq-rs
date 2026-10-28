@@ -3,7 +3,7 @@ use crate::{Counter, Job, RedisPool, RetryOpts, UnitOfWork, WorkerRef};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{error, warn};
 
 #[async_trait]
 pub trait ServerMiddleware {
@@ -218,7 +218,7 @@ impl ServerMiddleware for RetryMiddleware {
                 error!("Failed to add job to dead set: {:?}", err);
             }
         } else {
-            error!({
+            warn!({
                 "status" = "fail",
                 "class" = &job.class,
                 "jid" = &job.jid,
