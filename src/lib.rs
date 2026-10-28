@@ -561,6 +561,26 @@ pub struct Job {
 pub struct UnitOfWork {
     pub queue: String,
     pub job: Job,
+    /// Set when this job was claimed via reliable fetch
+    /// ([`ProcessorConfig::reliable`]) — i.e. moved into a per-process
+    /// in-progress list with `RPOPLPUSH`/`BRPOPLPUSH` instead of plain
+    /// `BRPOP`. Carries what the [`Processor`] needs to ack the job out of
+    /// that list once it finishes, and what orphan recovery needs to requeue
+    /// it if this process dies first. `None` for the default `BRPOP` path and
+    /// for jobs reconstructed via [`UnitOfWork::from_job`].
+    pub(crate) reliable: Option<ReliableClaim>,
+}
+
+/// Bookkeeping for a reliably-fetched job.
+///
+/// `inprogress_key` is the pre-namespace in-progress list key
+/// (`queue:<q>:inprogress:<identity>`); `job_raw` is the exact payload string
+/// stored in that list, kept verbatim so the completion `LREM` matches it
+/// byte-for-byte.
+#[derive(Debug, Clone)]
+pub(crate) struct ReliableClaim {
+    pub(crate) inprogress_key: String,
+    pub(crate) job_raw: String,
 }
 
 impl UnitOfWork {
@@ -569,6 +589,7 @@ impl UnitOfWork {
         Self {
             queue: format!("queue:{}", &job.queue),
             job,
+            reliable: None,
         }
     }
 

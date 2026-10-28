@@ -1,15 +1,43 @@
 use super::Result;
 use crate::stats::generate_tid;
 use crate::{
-    periodic::PeriodicJob, Chain, Counter, Job, RedisPool, Scheduled, ServerMiddleware,
-    StatsPublisher, UnitOfWork, Worker, WorkerRef,
+    periodic::PeriodicJob, Chain, Counter, Job, RedisPool, ReliableClaim, Scheduled,
+    ServerMiddleware, StatsPublisher, UnitOfWork, Worker, WorkerRef,
 };
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::select;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
+
+/// Redis SET (pre-namespace) listing every reliable-fetch in-progress list
+/// currently in use, so a surviving or restarted process can find the lists
+/// belonging to dead processes and requeue them. Members are the pre-namespace
+/// in-progress list keys (`queue:<q>:inprogress:<identity>`).
+const WORKING_SET: &str = "reliable_fetch:working";
+
+/// Redis SET of paused queue names (bare, e.g. `events_loader_backfill`),
+/// written by Sidekiq's `Queue#pause!`/`#unpause!` (`SADD`/`SREM "paused"`).
+/// Fetch skips any queue in this set, matching Sidekiq Pro's
+/// `BasicFetch`/`SuperFetch` `active_queues = queues - paused`.
+const PAUSED_SET: &str = "paused";
+
+/// How often the cached paused-queue set is refreshed from Redis. Sidekiq Pro
+/// updates instantly via pub/sub; we poll, so a pause/unpause takes effect
+/// within this window. A few seconds of lag is fine for an operator pause.
+const PAUSED_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Sleep when every configured queue is paused, so the fetch loop doesn't spin
+/// (there's no `BRPOP` to block on). Matches the `BRPOP` poll cadence.
+const ALL_PAUSED_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Redis SET listing all known queues — what Sidekiq's web UI renders on its
+/// Queues page (`Sidekiq::Queue.all` = `SSCAN queues`). Sidekiq adds to it on
+/// client push; we also register consumed queues here on boot so they're
+/// visible when idle.
+const QUEUES_SET: &str = "queues";
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub enum WorkFetcher {
@@ -34,6 +62,16 @@ pub struct Processor {
     // heartbeat registers in `processes`); `tid` is this worker's thread id.
     identity: Option<String>,
     tid: Option<String>,
+    // Reliable-fetch only: in-progress list keys this worker has already
+    // recorded in the `WORKING_SET` registry, so the `SADD` runs once per
+    // (queue, identity) rather than on every claim. Per-clone (each `run()`
+    // worker gets its own); the `SADD` is idempotent so a missed dedupe is
+    // harmless.
+    registered_inprogress: HashSet<String>,
+    // Bare names of currently-paused queues (the Redis `paused` set), refreshed
+    // periodically by a `run()` background task and shared across all worker
+    // clones. `fetch` skips any queue in here. Empty until the first refresh.
+    paused: Arc<RwLock<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -65,6 +103,41 @@ pub struct ProcessorConfig {
     /// Queue-specific configurations. The queues specified in this field do not need to match
     /// the list of queues provided to [`Processor::new`].
     pub queue_configs: BTreeMap<String, QueueConfig>,
+
+    /// When `true`, jobs are fetched with *reliable* semantics: each job is
+    /// claimed with `RPOPLPUSH`/`BRPOPLPUSH` into a per-process in-progress
+    /// list (`queue:<q>:inprogress:<identity>`) instead of plain `BRPOP`, and
+    /// a background sweep requeues the in-progress lists of processes that have
+    /// died. This makes a job that is in-flight when the process is restarted
+    /// or killed survive (it is re-run after recovery) instead of being lost —
+    /// the equivalent of Sidekiq Pro's `super_fetch`. Delivery becomes
+    /// at-least-once, so workers should be idempotent.
+    ///
+    /// Recovery judges a process dead by the absence of its heartbeat hash
+    /// (`EXISTS <identity>`, a 60s TTL refreshed every 5s). This makes the
+    /// heartbeat operationally load-bearing: if a *live* process's beat is
+    /// starved past the 60s TTL, a sibling will judge it dead and requeue its
+    /// in-flight jobs, running them a second time. Because each worker holds a
+    /// pooled connection for its blocking `BRPOPLPUSH`, size the Redis pool to
+    /// at least `num_workers` + headroom so the heartbeat publish never blocks
+    /// on connection acquisition. The 12× margin (60s TTL / 5s beat) makes this
+    /// unlikely, but it is the main new operational dependency of this mode.
+    ///
+    /// Defaults to `false`, preserving the original at-most-once `BRPOP` fetch.
+    pub reliable: bool,
+
+    /// On shutdown (the [`Processor::get_cancellation_token`] is cancelled,
+    /// e.g. from a SIGTERM handler), how long an in-flight job is given to
+    /// finish before it is interrupted and pushed back onto its queue for a
+    /// surviving/replacement process to run. This is the Rust equivalent of
+    /// Ruby Sidekiq's shutdown `timeout` + `BasicFetch#bulk_requeue`: jobs
+    /// that finish within the window are acked normally; those that don't
+    /// (e.g. a long backfill) are re-queued (at-least-once) rather than lost
+    /// to the imminent process exit. Set it comfortably below your
+    /// orchestrator's kill grace (e.g. k8s `terminationGracePeriodSeconds`) so
+    /// the requeue completes before SIGKILL. Defaults to 25s (Ruby Sidekiq's
+    /// default `-t`).
+    pub shutdown_grace: Duration,
 }
 
 #[derive(Default, Clone)]
@@ -107,6 +180,20 @@ impl ProcessorConfig {
         self.queue_configs.insert(queue, config);
         self
     }
+
+    /// Enable reliable fetch (see [`ProcessorConfig::reliable`]).
+    #[must_use]
+    pub fn reliable(mut self, reliable: bool) -> Self {
+        self.reliable = reliable;
+        self
+    }
+
+    /// Set the shutdown grace window (see [`ProcessorConfig::shutdown_grace`]).
+    #[must_use]
+    pub fn shutdown_grace(mut self, grace: Duration) -> Self {
+        self.shutdown_grace = grace;
+        self
+    }
 }
 
 impl Default for ProcessorConfig {
@@ -115,6 +202,8 @@ impl Default for ProcessorConfig {
             num_workers: num_cpus::get(),
             balance_strategy: Default::default(),
             queue_configs: Default::default(),
+            reliable: false,
+            shutdown_grace: Duration::from_secs(25),
         }
     }
 }
@@ -148,6 +237,8 @@ impl Processor {
             config: Default::default(),
             identity: None,
             tid: None,
+            registered_inprogress: HashSet::new(),
+            paused: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -157,21 +248,196 @@ impl Processor {
     }
 
     pub async fn fetch(&mut self) -> Result<Option<UnitOfWork>> {
+        // Reliable fetch needs the process identity (to name its per-process
+        // in-progress list). It's assigned by `run()`; if absent (e.g. a bare
+        // `process_one()` outside `run()`), fall back to the plain BRPOP path
+        // rather than silently doing nothing.
+        if self.config.reliable {
+            if let Some(identity) = self.identity.clone() {
+                return self.fetch_reliable(&identity).await;
+            }
+        }
+        self.fetch_brpop().await
+    }
+
+    /// Original at-most-once fetch: a single blocking `BRPOP` across all
+    /// queues. The job leaves Redis the instant it's popped, so a crash before
+    /// it finishes loses it.
+    async fn fetch_brpop(&mut self) -> Result<Option<UnitOfWork>> {
         self.run_balance_strategy();
 
-        let response: Option<(String, String)> = self
-            .redis
-            .get()
-            .await?
-            .brpop(self.queues.clone().into(), 2)
-            .await?;
+        let active = self.active_queues();
+        if active.is_empty() {
+            // Every configured queue is paused — back off so we don't spin
+            // (there's no BRPOP to block on).
+            tokio::time::sleep(ALL_PAUSED_BACKOFF).await;
+            return Ok(None);
+        }
+
+        let response: Option<(String, String)> = self.redis.get().await?.brpop(active, 2).await?;
 
         if let Some((queue, job_raw)) = response {
             let job: Job = serde_json::from_str(&job_raw)?;
-            return Ok(Some(UnitOfWork { queue, job }));
+            return Ok(Some(UnitOfWork {
+                queue,
+                job,
+                reliable: None,
+            }));
         }
 
         Ok(None)
+    }
+
+    /// Reliable fetch: claim a job by atomically moving it into this process's
+    /// per-process in-progress list (`queue:<q>:inprogress:<identity>`), so it
+    /// survives a crash and can be requeued by [`recover_orphaned_work`].
+    ///
+    /// First a non-blocking `RPOPLPUSH` sweep across all queues in priority
+    /// order (stopping at the first hit — a pipelined sweep would strand the
+    /// extra pops). If every queue is empty, block on the rotated head queue
+    /// with `BRPOPLPUSH` so we don't busy-loop; the other queues are re-checked
+    /// by the next tick's sweep (≤2s later).
+    async fn fetch_reliable(&mut self, identity: &str) -> Result<Option<UnitOfWork>> {
+        self.run_balance_strategy();
+        let queues = self.active_queues();
+        if queues.is_empty() {
+            // Every configured queue is paused — back off rather than spin.
+            tokio::time::sleep(ALL_PAUSED_BACKOFF).await;
+            return Ok(None);
+        }
+
+        // (queue_key, inprogress_key, job_raw) for the first claim, if any.
+        let claim: Option<(String, String, String)> = {
+            let mut conn = self.redis.get().await?;
+            let mut found = None;
+            for queue_key in &queues {
+                let inprogress = Self::inprogress_key(queue_key, identity);
+                if let Some(job_raw) = conn
+                    .rpoplpush(queue_key.clone(), inprogress.clone())
+                    .await?
+                {
+                    found = Some((queue_key.clone(), inprogress, job_raw));
+                    break;
+                }
+            }
+            if found.is_none() {
+                if let Some(head) = queues.first() {
+                    let inprogress = Self::inprogress_key(head, identity);
+                    if let Some(job_raw) =
+                        conn.brpoplpush(head.clone(), inprogress.clone(), 2).await?
+                    {
+                        found = Some((head.clone(), inprogress, job_raw));
+                    }
+                }
+            }
+            found
+        };
+
+        let Some((queue, inprogress, job_raw)) = claim else {
+            return Ok(None);
+        };
+
+        // Record this in-progress list in the registry (once per worker) so
+        // orphan recovery can find and requeue it if this process dies. Best
+        // effort: on failure the job is still claimed and will run; we just
+        // roll back the dedupe flag so a later tick retries the registration.
+        if self.registered_inprogress.insert(inprogress.clone()) {
+            let registered: Result<()> = async {
+                let mut conn = self.redis.get().await?;
+                conn.sadd(WORKING_SET.to_string(), inprogress.clone())
+                    .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(err) = registered {
+                error!(
+                    inprogress = %inprogress,
+                    "reliable fetch: failed to register in-progress list: {:?}",
+                    err
+                );
+                self.registered_inprogress.remove(&inprogress);
+            }
+        }
+
+        let job: Job = serde_json::from_str(&job_raw)?;
+        Ok(Some(UnitOfWork {
+            queue,
+            job,
+            reliable: Some(ReliableClaim {
+                inprogress_key: inprogress,
+                job_raw,
+            }),
+        }))
+    }
+
+    /// Per-process in-progress list key for a queue. `queue_key` is already the
+    /// `queue:<name>` form; appending the owner identity means a process only
+    /// ever drains its own claims and orphan recovery can attribute a stranded
+    /// list to the process that died.
+    fn inprogress_key(queue_key: &str, identity: &str) -> String {
+        format!("{queue_key}:inprogress:{identity}")
+    }
+
+    /// This processor's queues (`queue:<name>` form, in current balance order)
+    /// minus any that are paused — Sidekiq's `active_queues = queues - paused`.
+    /// The cached `paused` set holds bare names, so the `queue:` prefix is
+    /// stripped to compare. An empty result means every queue is paused.
+    fn active_queues(&self) -> Vec<String> {
+        let paused = self.paused.read().unwrap_or_else(|e| e.into_inner());
+        self.queues
+            .iter()
+            .filter(|q| !paused.contains(q.strip_prefix("queue:").unwrap_or(q)))
+            .cloned()
+            .collect()
+    }
+
+    /// Refresh the cached paused-queue set from Redis (`SMEMBERS paused`). On a
+    /// Redis error the previous set is kept (so a blip doesn't accidentally
+    /// un-pause every queue). Static so the `run()` refresher task can call it
+    /// with just the pool + shared set rather than a whole `Processor` clone.
+    async fn refresh_paused_into(redis: &RedisPool, paused: &Arc<RwLock<HashSet<String>>>) {
+        let members: Result<Vec<String>> = async {
+            let mut conn = redis.get().await?;
+            Ok(conn.smembers(PAUSED_SET.to_string()).await?)
+        }
+        .await;
+        match members {
+            Ok(members) => {
+                let set: HashSet<String> = members.into_iter().collect();
+                if let Ok(mut w) = paused.write() {
+                    *w = set;
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "sidekiq",
+                error = %e,
+                "failed to refresh paused-queue set; keeping last known",
+            ),
+        }
+    }
+
+    /// Add this processor's (bare) queue names to the Redis `queues` set so the
+    /// Sidekiq web UI lists them even when idle. Sidekiq only registers a queue
+    /// there on client push (`Client#push` → `SADD queues`), so a consume-only
+    /// queue stays invisible — and a queue deleted while empty never reappears —
+    /// until its next job is enqueued. Best-effort: a Redis error is logged.
+    async fn register_queues(redis: &RedisPool, queues: &[String]) {
+        if queues.is_empty() {
+            return;
+        }
+        let result: Result<()> = async {
+            let mut conn = redis.get().await?;
+            conn.sadd(QUEUES_SET.to_string(), queues.to_vec()).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            tracing::warn!(
+                target: "sidekiq",
+                error = %e,
+                "failed to register queues in the 'queues' set",
+            );
+        }
     }
 
     /// Re-order the `Processor#queues` based on the `ProcessorConfig#balance_strategy`.
@@ -231,11 +497,49 @@ impl Processor {
         // Publish this job to the Sidekiq WorkSet (`<identity>:work`) so it shows
         // on the web "Busy" page, then clear it whether the job succeeds or fails.
         self.set_work(&work).await;
-        let result = self
-            .chain
-            .call(&work.job, worker, self.redis.clone())
-            .await;
+
+        // Run the job. If shutdown is signalled (the cancellation token fires,
+        // e.g. from a SIGTERM handler) while the job is in flight, give it
+        // `shutdown_grace` to finish; if it doesn't, interrupt it and push it
+        // back onto its queue so a surviving/replacement process runs it —
+        // Ruby Sidekiq's shutdown `timeout` + `BasicFetch#bulk_requeue`. Without
+        // this a long job (e.g. a backfill) outlives the OS kill grace and is
+        // lost. `None` ⇒ interrupted-and-requeued (don't ack/log "done").
+        let cancel = self.cancellation_token.clone();
+        let grace = self.config.shutdown_grace;
+        let outcome: Option<Result<()>> = {
+            let job_fut = self.chain.call(&work.job, worker, self.redis.clone());
+            tokio::pin!(job_fut);
+            tokio::select! {
+                biased;
+                r = &mut job_fut => Some(r),
+                // Shutdown signalled: let the job finish within the grace
+                // window. `timeout(..).ok()` is `Some(result)` if it finished,
+                // `None` (Elapsed) if it must be interrupted and requeued.
+                () = cancel.cancelled() => tokio::time::timeout(grace, &mut job_fut).await.ok(),
+            }
+        };
+
         self.clear_work().await;
+
+        let Some(result) = outcome else {
+            // Interrupted by shutdown after the grace window: requeue the job
+            // (and, in reliable mode, drop its in-progress copy so recovery
+            // doesn't run it a second time) so the next process picks it up.
+            self.requeue_interrupted(&work).await;
+            return Ok(WorkFetcher::Done);
+        };
+
+        // Reliable fetch: the job has reached a terminal state inside
+        // `chain.call` — it either succeeded or the retry middleware already
+        // moved it to the `retry`/`dead` set — so drop our in-progress copy.
+        // Done regardless of `result`: a failed job already lives in
+        // `retry`/`dead`, and leaving the in-progress copy would let orphan
+        // recovery re-run it later as a duplicate.
+        if let Some(claim) = &work.reliable {
+            self.reliable_ack(claim).await;
+        }
+
         result?;
 
         // TODO: Make this only say "done" when the job is successful.
@@ -249,6 +553,64 @@ impl Processor {
             "jid" = &work.job.jid}, "sidekiq");
 
         Ok(WorkFetcher::Done)
+    }
+
+    /// Push a job that was interrupted by shutdown back onto its queue so a
+    /// surviving/replacement process runs it — the free-Sidekiq
+    /// `BasicFetch#bulk_requeue` behavior ("worse to lose a job than to run it
+    /// twice", i.e. at-least-once).
+    ///
+    /// In reliable mode this is an **atomic** move (`requeue_if_inprogress`):
+    /// the job is RPUSH'd back *only if* it's still in our in-progress list. If
+    /// orphan recovery on the replacement process already requeued it (it
+    /// drains dead processes' in-progress lists, and our heartbeat is gone by
+    /// the time we get here), the move is a no-op — so the shutdown requeue and
+    /// recovery never both requeue the same job and produce a duplicate. In
+    /// BRPOP mode the job lives only in memory (no in-progress copy, no
+    /// recovery to race), so it's pushed back unconditionally. Best-effort: a
+    /// Redis error is logged; in reliable mode orphan recovery is the backstop.
+    async fn requeue_interrupted(&self, work: &UnitOfWork) {
+        let queue_key = format!("queue:{}", work.job.queue);
+
+        let result: Result<bool> = async {
+            let mut conn = self.redis.get().await?;
+            match &work.reliable {
+                Some(claim) => Ok(conn
+                    .requeue_if_inprogress(
+                        claim.inprogress_key.clone(),
+                        queue_key.clone(),
+                        claim.job_raw.clone(),
+                    )
+                    .await?),
+                None => {
+                    conn.rpush(queue_key.clone(), serde_json::to_string(&work.job)?)
+                        .await?;
+                    Ok(true)
+                }
+            }
+        }
+        .await;
+
+        match result {
+            Ok(true) => info!(
+                target: "sidekiq",
+                class = %work.job.class,
+                jid = %work.job.jid,
+                queue = %work.job.queue,
+                "requeued in-flight job interrupted by shutdown",
+            ),
+            Ok(false) => info!(
+                target: "sidekiq",
+                class = %work.job.class,
+                jid = %work.job.jid,
+                "shutdown: job already requeued by recovery — not duplicating",
+            ),
+            Err(e) => error!(
+                jid = %work.job.jid,
+                "requeue on shutdown failed (reliable-fetch recovery is the backstop): {:?}",
+                e
+            ),
+        }
     }
 
     /// Record an in-flight job in this process's Sidekiq WorkSet
@@ -291,6 +653,30 @@ impl Processor {
 
         if let Err(err) = result {
             error!("Error clearing sidekiq work state: {:?}", err);
+        }
+    }
+
+    /// Reliable fetch: remove a finished job from its in-progress list. The
+    /// payload carries a unique `jid`, so `LREM` with `count = -1` (one match
+    /// scanning from the tail) removes exactly this job's copy. Best-effort: a
+    /// failure only means the job lingers in the list and may be re-run by
+    /// orphan recovery once this process's heartbeat expires (at-least-once).
+    async fn reliable_ack(&self, claim: &ReliableClaim) {
+        let result: Result<()> = async {
+            let mut conn = self.redis.get().await?;
+            let _: usize = conn
+                .lrem(claim.inprogress_key.clone(), -1, claim.job_raw.clone())
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            error!(
+                inprogress = %claim.inprogress_key,
+                "reliable fetch: failed to ack (LREM) finished job: {:?}",
+                err
+            );
         }
     }
 
@@ -348,6 +734,45 @@ impl Processor {
             self.config.num_workers,
         );
         let identity = stats_publisher.identity().to_string();
+
+        // Publish one heartbeat synchronously BEFORE any worker can fetch, so a
+        // sibling process running reliable-fetch orphan recovery never mistakes
+        // this freshly-booted process for a dead one (its heartbeat hash exists
+        // from t=0, closing the window before the 5s stats loop's first beat).
+        if let Err(err) = stats_publisher.publish_stats(self.redis.clone()).await {
+            error!("Error publishing initial processor heartbeat: {:?}", err);
+        }
+
+        // Reliable fetch: requeue jobs stranded in the in-progress lists of
+        // processes that died before us (the deploy/restart case). The periodic
+        // sweep spawned below catches deaths that happen while we're running.
+        if self.config.reliable {
+            match recover_orphaned_work(&self.redis, &identity, WORKING_SET).await {
+                Ok(n) if n > 0 => {
+                    info!(
+                        recovered = n,
+                        "reliable fetch: requeued orphaned jobs at boot"
+                    )
+                }
+                Ok(_) => {}
+                Err(err) => error!(
+                    "reliable fetch: boot-time orphan recovery failed: {:?}",
+                    err
+                ),
+            }
+        }
+
+        // Load the paused-queue set BEFORE workers start fetching, so a queue
+        // that's already paused isn't briefly drained on boot. Refreshed by the
+        // periodic task spawned below.
+        Self::refresh_paused_into(&self.redis, &self.paused).await;
+
+        // Register the queues we consume in the Redis `queues` set so they show
+        // up in the Sidekiq web UI even when idle, and reappear after a redeploy
+        // if one was deleted while empty. Sidekiq only adds a queue to this set
+        // on client push, so a consume-only queue (e.g. a UI-triggered backfill
+        // queue) would otherwise be invisible until its next job is enqueued.
+        Self::register_queues(&self.redis, &self.human_readable_queues).await;
 
         // Logic for spawning shared workers (workers that handles multiple queues) and dedicated
         // workers (workers that handle a single queue).
@@ -495,6 +920,58 @@ impl Processor {
             }
         });
 
+        // Reliable fetch: periodically requeue jobs stranded by processes that
+        // died while we were running. Liveness is the heartbeat hash's 60s TTL,
+        // so a killed process's jobs are recovered within ~60s.
+        if self.config.reliable {
+            join_set.spawn({
+                let redis = self.redis.clone();
+                let cancellation_token = self.cancellation_token.clone();
+                let identity = identity.clone();
+                async move {
+                    loop {
+                        select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                            _ = cancellation_token.cancelled() => {
+                                break;
+                            }
+                        }
+
+                        match recover_orphaned_work(&redis, &identity, WORKING_SET).await {
+                            Ok(n) if n > 0 => {
+                                info!(recovered = n, "reliable fetch: requeued orphaned jobs")
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                error!("reliable fetch: orphan recovery sweep failed: {:?}", err)
+                            }
+                        }
+                    }
+
+                    debug!("Broke out of loop for reliable-fetch orphan recovery");
+                }
+            });
+        }
+
+        // Periodically refresh the paused-queue set so `Queue#pause!` /
+        // `#unpause!` from the Sidekiq web UI (or API) takes effect here within
+        // `PAUSED_REFRESH_INTERVAL`.
+        join_set.spawn({
+            let redis = self.redis.clone();
+            let paused = self.paused.clone();
+            let cancellation_token = self.cancellation_token.clone();
+            async move {
+                loop {
+                    select! {
+                        _ = tokio::time::sleep(PAUSED_REFRESH_INTERVAL) => {}
+                        _ = cancellation_token.cancelled() => break,
+                    }
+                    Self::refresh_paused_into(&redis, &paused).await;
+                }
+                debug!("Broke out of loop for paused-queue refresh");
+            }
+        });
+
         while let Some(result) = join_set.join_next().await {
             if let Err(err) = result {
                 error!("Processor had a spawned task return an error: {}", err);
@@ -524,6 +1001,66 @@ fn work_record(job: &Job) -> Result<String> {
     Ok(record.to_string())
 }
 
+/// Requeue jobs stranded in the in-progress lists of dead processes.
+///
+/// Reliable fetch moves each claimed job into a per-process list
+/// `queue:<q>:inprogress:<identity>` and records that list in [`WORKING_SET`].
+/// A process that dies mid-job leaves its claimed jobs there. This walks the
+/// registry and, for every list whose owning process is no longer alive,
+/// moves the jobs back onto their original queue and drops the registry entry.
+/// Returns the number of jobs requeued.
+///
+/// Liveness is the heartbeat hash (`EXISTS <identity>`, a 60s TTL refreshed
+/// every 5s by the stats loop) — **not** membership in the `processes` set,
+/// which has no TTL and lingers after an ungraceful death. Concurrent
+/// recoverers are safe: each job is moved by exactly one `RPOPLPUSH` (any
+/// other recoverer sees an empty list), and `SREM` is idempotent.
+pub(crate) async fn recover_orphaned_work(
+    redis: &RedisPool,
+    my_identity: &str,
+    working_set: &str,
+) -> Result<usize> {
+    let mut conn = redis.get().await?;
+    let members: Vec<String> = conn.smembers(working_set.to_string()).await?;
+    let mut requeued = 0usize;
+
+    for member in members {
+        // member == "queue:<q>:inprogress:<identity>". Split on the last
+        // ":inprogress:" so the queue key (which may contain ':') and the owner
+        // identity (host:pid:nonce, also ':'-laden) are both recovered intact.
+        let Some((queue_key, owner)) = member.rsplit_once(":inprogress:") else {
+            // Unrecognized entry — drop it so the registry can't grow unbounded.
+            let _ = conn.srem(working_set.to_string(), member.clone()).await;
+            continue;
+        };
+
+        // Our own list — we're alive, leave it.
+        if owner == my_identity {
+            continue;
+        }
+
+        // Owner still alive (heartbeat present) — leave its in-flight work.
+        if conn.exists(owner.to_string()).await? {
+            continue;
+        }
+
+        // Owner is dead: move every stranded job back onto its queue.
+        while conn
+            .rpoplpush(member.clone(), queue_key.to_string())
+            .await?
+            .is_some()
+        {
+            requeued += 1;
+        }
+
+        // The list is now empty; drop the registry entry. If the owner somehow
+        // revives it will re-register on its next claim.
+        let _ = conn.srem(working_set.to_string(), member.clone()).await;
+    }
+
+    Ok(requeued)
+}
+
 #[cfg(test)]
 mod work_set_tests {
     use super::*;
@@ -548,5 +1085,538 @@ mod work_set_tests {
         assert_eq!(payload["jid"], "abc123");
         assert_eq!(payload["args"][1], "x");
         assert!(payload["args"][0].is_number());
+    }
+}
+
+/// Reliable-fetch + orphan-recovery integration tests. These require a Redis
+/// listening on `redis://127.0.0.1/` (same as the other tests in this crate).
+/// Every test uses uniquely-named queues / identities / working sets so they
+/// stay isolated when the suite runs concurrently against one Redis.
+#[cfg(test)]
+mod reliable_fetch_tests {
+    use super::*;
+    use crate::{ProcessorConfig, RedisConnectionManager, RedisPool};
+    use bb8::Pool;
+    // Tests that touch the shared real `WORKING_SET` are `#[serial]` so one
+    // test's recovery sweep can't drain another's freshly-claimed (heartbeat-
+    // less) in-progress list mid-run. The recover-only tests above use unique
+    // working-set keys and need no serialization.
+    use serial_test::serial;
+
+    async fn test_pool() -> RedisPool {
+        let manager = RedisConnectionManager::new("redis://127.0.0.1/").unwrap();
+        Pool::builder().build(manager).await.unwrap()
+    }
+
+    /// Unique suffix so concurrent tests never share keys.
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}_{}", generate_tid())
+    }
+
+    async fn lpush(redis: &RedisPool, key: &str, val: &str) {
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("LPUSH")
+            .arg(key)
+            .arg(val)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    async fn llen(redis: &RedisPool, key: &str) -> usize {
+        let mut conn = redis.get().await.unwrap();
+        redis::cmd("LLEN")
+            .arg(key)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap()
+    }
+
+    async fn sadd(redis: &RedisPool, set: &str, member: &str) {
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("SADD")
+            .arg(set)
+            .arg(member)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    async fn sismember(redis: &RedisPool, set: &str, member: &str) -> bool {
+        let mut conn = redis.get().await.unwrap();
+        redis::cmd("SISMEMBER")
+            .arg(set)
+            .arg(member)
+            .query_async::<i64>(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap()
+            == 1
+    }
+
+    /// Mark an identity "alive" by creating a key named exactly like its
+    /// heartbeat hash (recovery checks `EXISTS <identity>`).
+    async fn mark_alive(redis: &RedisPool, identity: &str) {
+        let mut conn = redis.get().await.unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(identity)
+            .arg("1")
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    async fn del(redis: &RedisPool, key: &str) {
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("DEL")
+            .arg(key)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recover_requeues_dead_owners_jobs() {
+        let redis = test_pool().await;
+        let queue_key = format!("queue:{}", unique("rf_dead"));
+        let dead_owner = unique("deadhost:111");
+        let member = format!("{queue_key}:inprogress:{dead_owner}");
+        let working_set = unique("rf_working");
+
+        // Two jobs left stranded in the dead process's in-progress list.
+        lpush(&redis, &member, "job-a").await;
+        lpush(&redis, &member, "job-b").await;
+        sadd(&redis, &working_set, &member).await;
+
+        let n = recover_orphaned_work(&redis, &unique("livehost:222"), &working_set)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 2, "both stranded jobs should be requeued");
+        assert_eq!(llen(&redis, &member).await, 0, "in-progress list drained");
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            2,
+            "jobs moved back to the queue"
+        );
+        assert!(
+            !sismember(&redis, &working_set, &member).await,
+            "registry entry removed once the dead list is drained"
+        );
+
+        del(&redis, &queue_key).await;
+        del(&redis, &working_set).await;
+    }
+
+    #[tokio::test]
+    async fn recover_skips_alive_owner() {
+        let redis = test_pool().await;
+        let queue_key = format!("queue:{}", unique("rf_alive"));
+        let owner = unique("alivehost:111");
+        let member = format!("{queue_key}:inprogress:{owner}");
+        let working_set = unique("rf_working");
+
+        lpush(&redis, &member, "job-a").await;
+        sadd(&redis, &working_set, &member).await;
+        mark_alive(&redis, &owner).await; // heartbeat present ⇒ alive
+
+        let n = recover_orphaned_work(&redis, &unique("livehost:222"), &working_set)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 0, "an alive owner's in-flight job must not be touched");
+        assert_eq!(
+            llen(&redis, &member).await,
+            1,
+            "in-progress list left intact"
+        );
+        assert!(
+            sismember(&redis, &working_set, &member).await,
+            "registry entry kept"
+        );
+
+        del(&redis, &member).await;
+        del(&redis, &working_set).await;
+        del(&redis, &owner).await;
+    }
+
+    #[tokio::test]
+    async fn recover_skips_our_own_inprogress_list() {
+        let redis = test_pool().await;
+        let queue_key = format!("queue:{}", unique("rf_self"));
+        let me = unique("selfhost:111");
+        let member = format!("{queue_key}:inprogress:{me}");
+        let working_set = unique("rf_working");
+
+        lpush(&redis, &member, "job-a").await;
+        sadd(&redis, &working_set, &member).await;
+
+        // We have no heartbeat key here, proving the skip is by identity match,
+        // not by liveness — a process never reclaims its own in-flight work.
+        let n = recover_orphaned_work(&redis, &me, &working_set)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 0, "our own list is never reclaimed");
+        assert_eq!(llen(&redis, &member).await, 1);
+        assert!(sismember(&redis, &working_set, &member).await);
+
+        del(&redis, &member).await;
+        del(&redis, &working_set).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reliable_fetch_claims_into_inprogress_then_acks() {
+        let redis = test_pool().await;
+        let q = unique("rf_claim");
+        let queue_key = format!("queue:{q}");
+        let identity = unique("claimhost:111");
+        let inprogress = format!("{queue_key}:inprogress:{identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        lpush(&redis, &queue_key, &payload).await;
+
+        let mut processor = Processor::new(redis.clone(), vec![q.clone()])
+            .with_config(ProcessorConfig::default().num_workers(1).reliable(true));
+        processor.identity = Some(identity.clone());
+
+        let uow = processor
+            .fetch_reliable(&identity)
+            .await
+            .unwrap()
+            .expect("a job should be claimed");
+
+        // The claim moved the job out of the queue and into our in-progress
+        // list, and tagged the unit of work with the ack bookkeeping.
+        assert_eq!(uow.job.jid, jid);
+        let claim = uow.reliable.as_ref().expect("claim is reliable");
+        assert_eq!(claim.inprogress_key, inprogress);
+        assert_eq!(llen(&redis, &queue_key).await, 0, "job removed from queue");
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            1,
+            "job parked in in-progress list"
+        );
+        assert!(
+            sismember(&redis, WORKING_SET, &inprogress).await,
+            "in-progress list registered for orphan recovery"
+        );
+
+        // Acking (the path taken when the job finishes) clears the copy so it
+        // can't be re-run by recovery.
+        processor.reliable_ack(claim).await;
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            0,
+            "ack removed the in-progress copy"
+        );
+
+        // Leave the shared WORKING_SET as we found it.
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("SREM")
+            .arg(WORKING_SET)
+            .arg(&inprogress)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    /// End-to-end: a worker claims a job via the real `fetch_reliable` path,
+    /// then "crashes" (we never ack and it has no heartbeat), and a sibling's
+    /// `recover_orphaned_work` sweep returns the stranded job to its queue.
+    /// Asserts on the specific queue/list rather than the requeued count so it
+    /// tolerates unrelated entries in the shared `WORKING_SET`.
+    #[tokio::test]
+    #[serial]
+    async fn reliable_fetch_then_recovery_returns_stranded_job_to_queue() {
+        let redis = test_pool().await;
+        let q = unique("rf_e2e");
+        let queue_key = format!("queue:{q}");
+        let dead_identity = unique("e2ehost:111"); // never gets a heartbeat
+        let inprogress = format!("{queue_key}:inprogress:{dead_identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        lpush(&redis, &queue_key, &payload).await;
+
+        // Worker claims the job through the real fetch path, then crashes
+        // (function returns, we never ack — simulating a killed process).
+        let mut processor = Processor::new(redis.clone(), vec![q.clone()])
+            .with_config(ProcessorConfig::default().num_workers(1).reliable(true));
+        processor.identity = Some(dead_identity.clone());
+        let uow = processor
+            .fetch_reliable(&dead_identity)
+            .await
+            .unwrap()
+            .expect("a job should be claimed");
+        assert_eq!(uow.job.jid, jid);
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            0,
+            "claimed out of the queue"
+        );
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            1,
+            "parked in the in-progress list"
+        );
+        drop(uow); // the "crash": the claim is dropped without ever being acked
+
+        // A sibling process sweeps: the crashed worker has no heartbeat, so its
+        // stranded job is requeued.
+        recover_orphaned_work(&redis, &unique("siblinghost:222"), WORKING_SET)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            0,
+            "in-progress list drained by recovery"
+        );
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            1,
+            "stranded job returned to its queue"
+        );
+        assert!(
+            !sismember(&redis, WORKING_SET, &inprogress).await,
+            "registry entry cleared once drained"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    /// The shutdown requeue (`BasicFetch#bulk_requeue` parity): a job
+    /// interrupted by SIGTERM is pushed back onto its queue, and in reliable
+    /// mode its in-progress copy is removed so recovery won't double it.
+    #[tokio::test]
+    async fn requeue_interrupted_pushes_back_and_clears_inprogress() {
+        let redis = test_pool().await;
+        let q = unique("rf_intr");
+        let queue_key = format!("queue:{q}");
+        let identity = unique("intrhost:1");
+        let inprogress = format!("{queue_key}:inprogress:{identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        // Simulate a reliably-claimed job: its payload sits in the in-progress
+        // list and the main queue is empty.
+        lpush(&redis, &inprogress, &payload).await;
+
+        let processor = Processor::new(redis.clone(), vec![q.clone()]);
+        let job: crate::Job = serde_json::from_str(&payload).unwrap();
+        let work = crate::UnitOfWork {
+            queue: queue_key.clone(),
+            job,
+            reliable: Some(crate::ReliableClaim {
+                inprogress_key: inprogress.clone(),
+                job_raw: payload.clone(),
+            }),
+        };
+
+        processor.requeue_interrupted(&work).await;
+
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            1,
+            "job pushed back onto its queue"
+        );
+        assert_eq!(
+            llen(&redis, &inprogress).await,
+            0,
+            "in-progress copy removed"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    /// If orphan recovery already requeued the job (its in-progress copy is
+    /// gone), the shutdown requeue is a no-op — it must NOT push a duplicate.
+    /// This is the race that produced two copies of the same backfill jid.
+    #[tokio::test]
+    async fn requeue_interrupted_does_not_duplicate_already_recovered_job() {
+        let redis = test_pool().await;
+        let q = unique("rf_intr_dup");
+        let queue_key = format!("queue:{q}");
+        let identity = unique("duphost:1");
+        let inprogress = format!("{queue_key}:inprogress:{identity}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        // In-progress list is EMPTY — i.e. recovery already moved the job out.
+        let processor = Processor::new(redis.clone(), vec![q.clone()]);
+        let job: crate::Job = serde_json::from_str(&payload).unwrap();
+        let work = crate::UnitOfWork {
+            queue: queue_key.clone(),
+            job,
+            reliable: Some(crate::ReliableClaim {
+                inprogress_key: inprogress.clone(),
+                job_raw: payload.clone(),
+            }),
+        };
+
+        processor.requeue_interrupted(&work).await;
+
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            0,
+            "must NOT requeue a job recovery already took (no duplicate)"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    /// Non-reliable (BRPOP) jobs are also requeued on shutdown — the payload is
+    /// re-serialized from the job (there's no in-progress copy to move).
+    #[tokio::test]
+    async fn requeue_interrupted_brpop_job_is_pushed_back() {
+        let redis = test_pool().await;
+        let q = unique("rf_intr_basic");
+        let queue_key = format!("queue:{q}");
+        let jid = unique("jid");
+        let payload = format!(
+            r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+        );
+
+        let processor = Processor::new(redis.clone(), vec![q.clone()]);
+        let job: crate::Job = serde_json::from_str(&payload).unwrap();
+        let work = crate::UnitOfWork {
+            queue: queue_key.clone(),
+            job,
+            reliable: None,
+        };
+
+        processor.requeue_interrupted(&work).await;
+
+        assert_eq!(
+            llen(&redis, &queue_key).await,
+            1,
+            "BRPOP job pushed back onto its queue"
+        );
+
+        del(&redis, &queue_key).await;
+    }
+
+    #[tokio::test]
+    async fn active_queues_excludes_paused() {
+        let redis = test_pool().await;
+        let p = Processor::new(redis, vec!["a".into(), "b".into(), "c".into()]);
+        *p.paused.write().unwrap() = std::collections::HashSet::from(["b".to_string()]);
+
+        assert_eq!(
+            p.active_queues(),
+            vec!["queue:a".to_string(), "queue:c".to_string()],
+            "paused queue 'b' is filtered out of the fetch set",
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_paused_loads_the_redis_paused_set() {
+        let redis = test_pool().await;
+        let q = unique("rf_paused_refresh");
+
+        // Mark the queue paused exactly like `Sidekiq::Queue#pause!` does.
+        {
+            let mut conn = redis.get().await.unwrap();
+            let _: i64 = redis::cmd("SADD")
+                .arg(PAUSED_SET)
+                .arg(&q)
+                .query_async(conn.unnamespaced_borrow_mut())
+                .await
+                .unwrap();
+        }
+
+        let paused = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        Processor::refresh_paused_into(&redis, &paused).await;
+        assert!(
+            paused.read().unwrap().contains(&q),
+            "refresh should pick up the paused queue from the Redis 'paused' set",
+        );
+
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("SREM")
+            .arg(PAUSED_SET)
+            .arg(&q)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_paused_queue_and_takes_the_active_one() {
+        let redis = test_pool().await;
+        let paused_q = unique("rf_pq");
+        let active_q = unique("rf_aq");
+        let pjid = unique("pjid");
+        let ajid = unique("ajid");
+        let mk = |q: &str, jid: &str| {
+            format!(
+                r#"{{"queue":"{q}","args":[],"retry":true,"class":"HardWorker","jid":"{jid}","created_at":1700000000.0}}"#
+            )
+        };
+        lpush(&redis, &format!("queue:{paused_q}"), &mk(&paused_q, &pjid)).await;
+        lpush(&redis, &format!("queue:{active_q}"), &mk(&active_q, &ajid)).await;
+
+        // Paused queue listed FIRST; no rotation, so if it weren't skipped it
+        // would be drained first.
+        let mut processor = Processor::new(redis.clone(), vec![paused_q.clone(), active_q.clone()])
+            .with_config(ProcessorConfig::default().balance_strategy(BalanceStrategy::None));
+        *processor.paused.write().unwrap() = std::collections::HashSet::from([paused_q.clone()]);
+
+        let uow = processor
+            .fetch_brpop()
+            .await
+            .unwrap()
+            .expect("the active queue's job should be fetched");
+        assert_eq!(
+            uow.job.jid, ajid,
+            "fetched from the active queue, skipping the paused one"
+        );
+        assert_eq!(
+            llen(&redis, &format!("queue:{paused_q}")).await,
+            1,
+            "paused queue's job is left untouched",
+        );
+
+        del(&redis, &format!("queue:{paused_q}")).await;
+        del(&redis, &format!("queue:{active_q}")).await;
+    }
+
+    /// Boot registration: consumed queues are added to the `queues` set so the
+    /// web UI lists them (and they reappear after a redeploy if deleted empty).
+    #[tokio::test]
+    async fn register_queues_adds_them_to_the_queues_set() {
+        let redis = test_pool().await;
+        let q1 = unique("rf_reg");
+        let q2 = unique("rf_reg");
+
+        Processor::register_queues(&redis, &[q1.clone(), q2.clone()]).await;
+
+        assert!(
+            sismember(&redis, "queues", &q1).await,
+            "q1 registered in the queues set"
+        );
+        assert!(
+            sismember(&redis, "queues", &q2).await,
+            "q2 registered in the queues set"
+        );
+
+        let mut conn = redis.get().await.unwrap();
+        let _: i64 = redis::cmd("SREM")
+            .arg("queues")
+            .arg(&q1)
+            .arg(&q2)
+            .query_async(conn.unnamespaced_borrow_mut())
+            .await
+            .unwrap();
     }
 }
