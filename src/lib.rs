@@ -319,8 +319,7 @@ pub trait Worker<Args>: Send + Sync {
         WorkerOpts::new()
     }
 
-    // TODO: Make configurable through opts and make opts accessible to the
-    // retry middleware through a Box<dyn Worker>.
+    /// Fallback retry limit when `Self::opts()` leaves retries set to `RetryOpts::Yes`.
     fn max_retries(&self) -> usize {
         25
     }
@@ -415,7 +414,11 @@ impl WorkerRef {
                     Box::pin(async move { invoke_worker(args, worker).await })
                 }
             })),
-            max_retries: worker.max_retries(),
+            max_retries: match W::opts().retry {
+                RetryOpts::Max(n) => n,
+                RetryOpts::Never => 0,
+                RetryOpts::Yes => worker.max_retries(),
+            },
         }
     }
 
