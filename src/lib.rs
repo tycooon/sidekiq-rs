@@ -319,8 +319,7 @@ pub trait Worker<Args>: Send + Sync {
         WorkerOpts::new()
     }
 
-    // TODO: Make configurable through opts and make opts accessible to the
-    // retry middleware through a Box<dyn Worker>.
+    /// Fallback retry limit when `Self::opts()` leaves retries set to `RetryOpts::Yes`.
     fn max_retries(&self) -> usize {
         25
     }
@@ -415,7 +414,11 @@ impl WorkerRef {
                     Box::pin(async move { invoke_worker(args, worker).await })
                 }
             })),
-            max_retries: worker.max_retries(),
+            max_retries: match W::opts().retry {
+                RetryOpts::Max(n) => n,
+                RetryOpts::Never => 0,
+                RetryOpts::Yes => worker.max_retries(),
+            },
         }
     }
 
@@ -561,6 +564,26 @@ pub struct Job {
 pub struct UnitOfWork {
     pub queue: String,
     pub job: Job,
+    /// Set when this job was claimed via reliable fetch
+    /// ([`ProcessorConfig::reliable`]) — i.e. moved into a per-process
+    /// in-progress list with `RPOPLPUSH`/`BRPOPLPUSH` instead of plain
+    /// `BRPOP`. Carries what the [`Processor`] needs to ack the job out of
+    /// that list once it finishes, and what orphan recovery needs to requeue
+    /// it if this process dies first. `None` for the default `BRPOP` path and
+    /// for jobs reconstructed via [`UnitOfWork::from_job`].
+    pub(crate) reliable: Option<ReliableClaim>,
+}
+
+/// Bookkeeping for a reliably-fetched job.
+///
+/// `inprogress_key` is the pre-namespace in-progress list key
+/// (`queue:<q>:inprogress:<identity>`); `job_raw` is the exact payload string
+/// stored in that list, kept verbatim so the completion `LREM` matches it
+/// byte-for-byte.
+#[derive(Debug, Clone)]
+pub(crate) struct ReliableClaim {
+    pub(crate) inprogress_key: String,
+    pub(crate) job_raw: String,
 }
 
 impl UnitOfWork {
@@ -569,6 +592,7 @@ impl UnitOfWork {
         Self {
             queue: format!("queue:{}", &job.queue),
             job,
+            reliable: None,
         }
     }
 

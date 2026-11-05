@@ -171,6 +171,17 @@ impl RedisConnection {
         self.connection.lpush(self.namespaced_key(key), value).await
     }
 
+    /// Push to the tail of a list. A job RPUSH'd onto its queue is the next one
+    /// a `BRPOP`/`RPOPLPUSH` consumer picks up — used by the shutdown requeue
+    /// so an interrupted job re-runs promptly (matches Ruby
+    /// `BasicFetch#bulk_requeue` / `UnitOfWork#requeue`). Key is namespaced.
+    pub async fn rpush<V>(&mut self, key: String, value: V) -> Result<(), RedisError>
+    where
+        V: ToRedisArgs + Send + Sync,
+    {
+        self.connection.rpush(self.namespaced_key(key), value).await
+    }
+
     pub async fn sadd<V>(&mut self, key: String, value: V) -> Result<(), RedisError>
     where
         V: ToRedisArgs + Send + Sync,
@@ -303,5 +314,96 @@ impl RedisConnection {
         V: ToRedisArgs + Send + Sync,
     {
         self.connection.zrem(self.namespaced_key(key), value).await
+    }
+
+    /// Reliable, non-blocking claim: atomically move the tail element of
+    /// `source` to the head of `destination`, returning the moved element
+    /// (`None` when `source` is empty). Both keys are namespaced. Used by
+    /// reliable fetch to claim a job into a per-process in-progress list.
+    pub async fn rpoplpush(
+        &mut self,
+        source: String,
+        destination: String,
+    ) -> Result<Option<String>, RedisError> {
+        self.connection
+            .rpoplpush(
+                self.namespaced_key(source),
+                self.namespaced_key(destination),
+            )
+            .await
+    }
+
+    /// Blocking variant of [`Self::rpoplpush`]: waits up to `timeout` seconds
+    /// for an element on `source` before moving it to `destination`. Returns
+    /// `None` on timeout. Both keys are namespaced.
+    pub async fn brpoplpush(
+        &mut self,
+        source: String,
+        destination: String,
+        timeout: usize,
+    ) -> Result<Option<String>, RedisError> {
+        self.connection
+            .brpoplpush(
+                self.namespaced_key(source),
+                self.namespaced_key(destination),
+                timeout as f64,
+            )
+            .await
+    }
+
+    /// Remove up to `count` copies of `value` from the list at `key` (Redis
+    /// `LREM`); a negative `count` scans from the tail. Returns the number of
+    /// elements removed. Key is namespaced. Used by reliable fetch to ack a
+    /// finished job out of its in-progress list.
+    pub async fn lrem(
+        &mut self,
+        key: String,
+        count: isize,
+        value: String,
+    ) -> Result<usize, RedisError> {
+        self.connection
+            .lrem(self.namespaced_key(key), count, value)
+            .await
+    }
+
+    pub async fn smembers(&mut self, key: String) -> Result<Vec<String>, RedisError> {
+        self.connection.smembers(self.namespaced_key(key)).await
+    }
+
+    /// Atomically requeue a reliably-claimed job interrupted by shutdown:
+    /// remove `payload` from the in-progress list and, **only if it was still
+    /// there**, RPUSH it onto `queue`. Returns `true` if it moved the job,
+    /// `false` if the job was already gone (e.g. orphan recovery on the
+    /// replacement process already requeued it). The atomicity is what stops
+    /// the shutdown requeue and recovery from BOTH re-queuing the same job —
+    /// without it they race and produce a duplicate. Both keys are namespaced.
+    pub async fn requeue_if_inprogress(
+        &mut self,
+        inprogress: String,
+        queue: String,
+        payload: String,
+    ) -> Result<bool, RedisError> {
+        const SCRIPT: &str = r"
+            if redis.call('LREM', KEYS[1], 1, ARGV[1]) > 0 then
+                redis.call('RPUSH', KEYS[2], ARGV[1])
+                return 1
+            end
+            return 0
+        ";
+        let inprogress = self.namespaced_key(inprogress);
+        let queue = self.namespaced_key(queue);
+        let moved: i64 = redis::cmd("EVAL")
+            .arg(SCRIPT)
+            .arg(2)
+            .arg(inprogress)
+            .arg(queue)
+            .arg(payload)
+            .query_async(self.unnamespaced_borrow_mut())
+            .await?;
+        Ok(moved == 1)
+    }
+
+    pub async fn exists(&mut self, key: String) -> Result<bool, RedisError> {
+        self.connection.exists(self.namespaced_key(key)).await
     }
 }
