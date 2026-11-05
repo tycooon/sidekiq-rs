@@ -101,6 +101,10 @@ sidekiq::perform_async(
 
 See more examples in `examples/demo.rs`.
 
+#### Retries
+
+A job with `"retry": true` uses the registered worker's retry options, including when it is enqueued by another client. Set `WorkerOpts::new().retry(0)` or `.retry(false)` to send failed jobs directly to the dead set. Default worker options allow 25 retries, or the limit returned by an override of `Worker::max_retries()`. A job with an explicit retry count overrides the worker's limit; a job with `"retry": false` always goes directly to the dead set on failure.
+
 #### Unique jobs
 
 Unique jobs are supported via the `unique_for` option which can be defined by default on the

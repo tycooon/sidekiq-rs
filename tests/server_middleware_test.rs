@@ -5,7 +5,7 @@ mod test {
     use serial_test::serial;
     use sidekiq::{
         ChainIter, Error, Job, Processor, RedisConnectionManager, RedisPool, Result, RetryOpts,
-        Scheduled, ServerMiddleware, UnitOfWork, WorkFetcher, Worker, WorkerRef,
+        Scheduled, ServerMiddleware, UnitOfWork, WorkFetcher, Worker, WorkerOpts, WorkerRef,
     };
     use std::sync::{Arc, Mutex};
 
@@ -46,6 +46,97 @@ mod test {
         async fn perform(&self, _args: ()) -> Result<()> {
             Err(Error::Message("big ouchie".to_string()))
         }
+    }
+
+    #[derive(Clone)]
+    struct ZeroRetryWorker;
+
+    #[async_trait]
+    impl Worker<()> for ZeroRetryWorker {
+        fn opts() -> WorkerOpts<(), Self> {
+            WorkerOpts::new().retry(0)
+        }
+
+        async fn perform(&self, args: ()) -> Result<()> {
+            AlwaysFailWorker.perform(args).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct NeverRetryWorker;
+
+    #[async_trait]
+    impl Worker<()> for NeverRetryWorker {
+        fn opts() -> WorkerOpts<(), Self> {
+            WorkerOpts::new().retry(false)
+        }
+
+        async fn perform(&self, args: ()) -> Result<()> {
+            AlwaysFailWorker.perform(args).await
+        }
+    }
+
+    async fn assert_external_job_retry<W: Worker<()> + 'static>(
+        worker: W,
+        retry: serde_json::Value,
+        should_retry: bool,
+    ) {
+        let queue = "external_retry_opts".to_string();
+        let (mut p, redis) = new_base_processor(queue.clone()).await;
+        p.register(worker);
+
+        let payload = serde_json::json!({
+            "class": W::class_name(),
+            "queue": queue,
+            "args": [],
+            "jid": "0123456789abcdef01234567",
+            "created_at": chrono::Utc::now().timestamp() as f64,
+            "retry": retry,
+        });
+        let job: Job = serde_json::from_value(payload).unwrap();
+        UnitOfWork::from_job(job).enqueue(&redis).await.unwrap();
+
+        assert_eq!(p.process_one_tick_once().await.unwrap(), WorkFetcher::Done);
+
+        let mut conn = redis.get().await.unwrap();
+        for (set, expected_len) in [
+            ("retry", usize::from(should_retry)),
+            ("dead", usize::from(!should_retry)),
+        ] {
+            let jobs = conn.zrange(set.to_string(), 0, -1).await.unwrap();
+            assert_eq!(jobs.len(), expected_len, "jobs in {set}");
+            if let Some(payload) = jobs.first() {
+                let job: Job = serde_json::from_str(payload).unwrap();
+                assert_eq!(job.class, W::class_name());
+                assert_eq!(job.jid, "0123456789abcdef01234567");
+                assert_eq!(job.retry_count, Some(0));
+                assert!(job.error_message.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn worker_zero_retries_sends_external_job_to_dead_set() {
+        assert_external_job_retry(ZeroRetryWorker, serde_json::json!(true), false).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_job_retry_count_overrides_worker_zero_retries() {
+        assert_external_job_retry(ZeroRetryWorker, serde_json::json!(3), true).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn default_worker_retries_external_job() {
+        assert_external_job_retry(AlwaysFailWorker, serde_json::json!(true), true).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn worker_never_retries_sends_external_job_to_dead_set() {
+        assert_external_job_retry(NeverRetryWorker, serde_json::json!(true), false).await;
     }
 
     #[derive(Clone)]
